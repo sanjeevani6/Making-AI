@@ -48,6 +48,7 @@ HANDWRITING_LARGE = "microsoft/trocr-large-handwritten"
 HANDWRITING_BATCH_SIZE = 8
 HANDWRITING_NUM_BEAMS = 5
 HANDWRITING_MAX_TOKENS = 96
-# TrOCR squeezes every crop to 384x384, so very wide lines lose detail.
-# Lines wider than this (width / height) are split at blank gaps.
-HANDWRITING_MAX_ASPECT = 9.0
+# TrOCR squeezes every crop to 384x384, so extremely wide lines lose detail.
+# Lines wider than this (width / line height) are split, but ONLY at real
+# blank gaps between words - never through a word.
+HANDWRITING_MAX_ASPECT = 18.0

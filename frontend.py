@@ -355,7 +355,19 @@ class OCRApp(ctk.CTk):
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         pil_image = Image.fromarray(rgb)
-        pil_image.thumbnail((560, 320))
+
+        # Fit the picture inside its panel; a fixed size gets cropped by the
+        # label (the edges of tables/pages looked "missing").
+        max_size = (560, 320)
+        try:
+            self.update_idletasks()
+            panel = label.master
+            pw, ph = panel.winfo_width(), panel.winfo_height()
+            if pw > 150 and ph > 150:
+                max_size = (pw - 40, ph - 90)
+        except Exception:
+            pass
+        pil_image.thumbnail(max_size)
         photo = ctk.CTkImage(
             light_image=pil_image,
             dark_image=pil_image,

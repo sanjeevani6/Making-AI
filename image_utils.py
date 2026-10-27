@@ -82,3 +82,20 @@ def fit_scale(gray, target=1800, max_scale=3.0, max_side=3500):
         return gray
     interp = cv2.INTER_CUBIC if s > 1 else cv2.INTER_AREA
     return cv2.resize(gray, None, fx=s, fy=s, interpolation=interp)
+
+
+def needs_inversion(gray):
+    """True when the background is darker than the text (light-on-dark).
+
+    Otsu splits pixels into two classes; the text is the minority class, so
+    if the *dark* class is the majority the page is light text on dark.
+    """
+    t, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    return float(np.mean(gray <= t)) > 0.5
+
+
+def ensure_dark_on_light(image):
+    """Return (image, was_inverted) with dark text on a light background."""
+    if needs_inversion(to_gray(image)):
+        return cv2.bitwise_not(image), True
+    return image, False

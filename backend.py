@@ -19,8 +19,8 @@ from PIL import Image
 
 import config
 from image_utils import (
-    estimate_skew, fit_scale, normalize_background, read_image,
-    rotate_keep_size, to_gray,
+    ensure_dark_on_light, estimate_skew, fit_scale, normalize_background,
+    read_image, rotate_keep_size, to_gray,
 )
 
 pytesseract.pytesseract.tesseract_cmd = config.TESSERACT_CMD
@@ -41,7 +41,10 @@ def preprocess_image(image_path):
         print(f"[ERROR] Could not load image: {image_path}")
         return None, None, None
 
-    gray = to_gray(image)
+    # Light text on a dark background (slides, screenshots, dark mode)
+    # must be flipped first: everything below assumes dark ink on paper.
+    fixed, _ = ensure_dark_on_light(image)
+    gray = to_gray(fixed)
 
     angle = estimate_skew(gray)
     if abs(angle) > 0.3:
@@ -217,8 +220,13 @@ def _get_handwriting_model():
     return _hw["model"], _hw["processor"], _hw["device"]
 
 
-def _valley_split(profile, start, end, parts):
-    """Cut [start, end) into `parts` pieces at the emptiest positions."""
+def _valley_split(profile, start, end, parts, max_cut_ratio=None):
+    """Cut [start, end) into `parts` pieces at the emptiest positions.
+
+    If `max_cut_ratio` is given, a cut is only made where the profile is at
+    most that fraction of its mean (i.e. a real gap); otherwise it is skipped.
+    """
+    mean = float(np.mean(profile[start:end])) if end > start else 0.0
     cuts = [start]
     span = (end - start) / parts
     for k in range(1, parts):
@@ -226,12 +234,76 @@ def _valley_split(profile, start, end, parts):
         lo = int(max(cuts[-1] + 1, ideal - span * 0.4))
         hi = int(min(end - 1, ideal + span * 0.4))
         if hi <= lo:
-            cuts.append(int(ideal))
+            if max_cut_ratio is None:
+                cuts.append(int(ideal))
             continue
-        window = profile[lo:hi]
-        cuts.append(lo + int(np.argmin(window)))
+        pos = lo + int(np.argmin(profile[lo:hi]))
+        if max_cut_ratio is not None and profile[pos] > max_cut_ratio * mean:
+            continue
+        cuts.append(pos)
     cuts.append(end)
     return list(zip(cuts[:-1], cuts[1:]))
+
+
+def _estimate_line_pitch(profile):
+    """Distance between text lines from the autocorrelation of the row
+    projection. Works even when lines touch and no row is empty."""
+    n = len(profile)
+    p = profile - profile.mean()
+    if n < 40 or not np.any(p):
+        return None
+    acf = np.correlate(p, p, mode="full")[n - 1:]
+    acf = acf / acf[0]
+    lo, hi = max(8, n // 120), n // 2
+    seg = acf[lo:hi]
+    peaks = [i for i in range(1, len(seg) - 1)
+             if seg[i] > seg[i - 1] and seg[i] >= seg[i + 1] and seg[i] > 0.15]
+    if not peaks:
+        return None
+    best = max(seg[i] for i in peaks)
+    # smallest lag that is nearly as strong as the best one (avoids 2x pitch)
+    pick = min(i for i in peaks if seg[i] >= 0.8 * best)
+    return lo + pick, float(seg[pick])
+
+
+def _comb_segments(smooth, pitch):
+    """Split the page into lines for regularly spaced text (ruled paper).
+
+    Cut points are placed one pitch apart, each snapped to the emptiest row
+    nearby; the next cut is measured from the previous snapped one so slow
+    drift in line spacing is followed. Returns [[top, bottom], ...].
+    """
+    H = len(smooth)
+    P = int(round(pitch))
+    phase = min(range(P), key=lambda ph: smooth[ph::P].sum())
+    cuts = [0]
+    pos = phase if phase > 0.3 * P else phase + P
+    while pos < H - 0.3 * P:
+        lo = int(max(cuts[-1] + 1, pos - 0.3 * P))
+        hi = int(min(H - 1, pos + 0.3 * P))
+        if hi <= lo:
+            break
+        cut = lo + int(np.argmin(smooth[lo:hi + 1]))
+        cuts.append(cut)
+        pos = cut + P
+    cuts.append(H)
+    segs = [[a, c] for a, c in zip(cuts[:-1], cuts[1:])]
+    mass = np.array([smooth[a:c].sum() for a, c in segs])
+    if not mass.any():
+        return []
+    keep = mass >= 0.2 * np.median(mass[mass > 0])
+    return [s for s, k in zip(segs, keep) if k]
+
+
+def _remove_specks(ink):
+    """Delete tiny connected components (paper grain, dust)."""
+    h, w = ink.shape
+    min_area = max(12, int(1.5e-5 * h * w))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        ink, connectivity=8)
+    keep = stats[:, cv2.CC_STAT_AREA] >= min_area
+    keep[0] = False
+    return keep[labels].astype(np.uint8) * 255
 
 
 def _clean_page(image):
@@ -239,10 +311,10 @@ def _clean_page(image):
     gray = to_gray(image)
     h, w = gray.shape
 
-    # Light blue notebook rules -> white (dark blue pen is kept).
+    # Light blue / green notebook rules -> white (dark pen is kept).
     if image.ndim == 3:
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        ruled = ((hsv[..., 0] >= 85) & (hsv[..., 0] <= 135)
+        ruled = ((hsv[..., 0] >= 40) & (hsv[..., 0] <= 135)
                  & (hsv[..., 1] > 25) & (gray > 140))
         gray = gray.copy()
         gray[ruled] = 255
@@ -263,8 +335,9 @@ def _clean_page(image):
     gray = gray.copy()
     gray[horiz > 0] = 255
 
-    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    return gray, ink
+    # Grain / dust is removed by size (an opening would also erase thin pen
+    # strokes).
+    return gray, _remove_specks(ink)
 
 
 def segment_handwriting_lines(image):
@@ -276,11 +349,12 @@ def segment_handwriting_lines(image):
     rows = np.count_nonzero(ink, axis=1).astype(np.float32)
     win = max(3, H // 200)
     smooth = np.convolve(rows, np.ones(win, np.float32) / win, mode="same")
-
-    nz = smooth[smooth > 0]
-    if nz.size == 0:
+    if not np.any(smooth > 0):
         return gray, []
-    thr = max(2.0, 0.2 * float(np.median(nz)))
+
+    # Threshold relative to the typical *ink* density, so grain in the
+    # gaps cannot glue lines together.
+    thr = max(2.0, 0.12 * float(np.percentile(smooth, 90)))
     active = smooth >= thr
 
     bands, y = [], 0
@@ -297,7 +371,6 @@ def segment_handwriting_lines(image):
         return gray, []
 
     med = float(np.median([b - t for t, b in bands]))
-
     merged = []
     for top, bottom in bands:
         if merged and top - merged[-1][1] <= 0.35 * med:
@@ -305,16 +378,37 @@ def segment_handwriting_lines(image):
         else:
             merged.append([top, bottom])
 
-    # Split bands that clearly contain several lines.
-    final = []
-    med = float(np.median([b - t for t, b in merged]))
-    for top, bottom in merged:
-        if len(merged) >= 3 and (bottom - top) > 2.3 * med:
-            parts = max(2, int(round((bottom - top) / med)))
-            final.extend([list(p) for p in _valley_split(smooth, top, bottom, parts)])
-        else:
-            final.append([top, bottom])
-    final = [b for b in final if (b[1] - b[0]) >= 0.3 * med]
+    # Typical line spacing: from the autocorrelation when possible (works
+    # for touching lines), else from the band heights.
+    est = _estimate_line_pitch(smooth)
+    pitch, strength = est if est else (None, 0.0)
+
+    if pitch and strength >= 0.35 and H / pitch >= 3:
+        # Regularly spaced lines (ruled paper / dense paragraph).
+        final = _comb_segments(smooth, pitch)
+        # trim each segment to its actual ink rows
+        trimmed = []
+        for a, c in final:
+            idx = np.where(smooth[a:c] >= thr)[0]
+            if idx.size:
+                trimmed.append([a + int(idx[0]), a + int(idx[-1]) + 1])
+        final = trimmed
+    else:
+        heights = [b - t for t, b in merged]
+        ref = float(pitch) if pitch else float(np.median(heights))
+        can_split = pitch is not None or len(merged) >= 3
+        final = []
+        for top, bottom in merged:
+            if can_split and (bottom - top) > 1.6 * ref:
+                parts = max(2, int(round((bottom - top) / ref)))
+                final.extend([list(p) for p in
+                              _valley_split(smooth, top, bottom, parts)])
+            else:
+                final.append([top, bottom])
+    if not final:
+        return gray, []
+    ref_h = float(np.median([b - t for t, b in final]))
+    final = [b for b in final if (b[1] - b[0]) >= 0.3 * ref_h]
 
     lines = []
     for top, bottom in final:
@@ -333,10 +427,9 @@ def segment_handwriting_lines(image):
             col_profile = np.convolve(
                 np.count_nonzero(band, axis=0).astype(np.float32),
                 np.ones(5, np.float32) / 5, mode="same")
-            pieces = _valley_split(col_profile, x1, x2, n)
+            # Only cut at genuine gaps between words, never through a word.
+            pieces = _valley_split(col_profile, x1, x2, n, max_cut_ratio=0.2)
             for k, (a, b) in enumerate(pieces):
-                # Pad only the outer edges; internal cuts stay exact so
-                # neighbouring crops never overlap (no duplicated words).
                 left = max(0, a - px) if k == 0 else a
                 right = min(W, b + px) if k == len(pieces) - 1 else b
                 boxes.append((left, y1, right, y2))
@@ -382,6 +475,8 @@ def recognize_handwriting(image_path, progress_cb=None):
     image = read_image(image_path)
     if image is None:
         raise ValueError(f"Could not load image: {image_path}")
+
+    image, _ = ensure_dark_on_light(image)
 
     # Straighten photographed notebook pages.
     angle = estimate_skew(to_gray(image))

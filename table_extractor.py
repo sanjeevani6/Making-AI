@@ -20,7 +20,10 @@ import pytesseract
 from pytesseract import Output
 
 import config
-from image_utils import estimate_skew, read_image, rotate_keep_size, to_gray
+from image_utils import (
+    ensure_dark_on_light, estimate_skew, needs_inversion, read_image,
+    rotate_keep_size, to_gray,
+)
 
 pytesseract.pytesseract.tesseract_cmd = config.TESSERACT_CMD
 
@@ -50,17 +53,24 @@ def _nearest(centres, value):
 
 def _ocr_cell(gray_cell, lang):
     """OCR one cell image (grayscale). Returns cleaned text."""
-    if gray_cell.size == 0:
-        return ""
-    # Skip empty cells: almost no dark pixels.
+    if gray_cell.size == 0 or gray_cell.std() < 8:
+        return ""  # empty / flat-coloured cell
+
+    # White text on a dark fill (typical header cells) -> dark on light.
+    if needs_inversion(gray_cell):
+        gray_cell = cv2.bitwise_not(gray_cell)
+    gray_cell = cv2.normalize(gray_cell, None, 0, 255, cv2.NORM_MINMAX)
+
+    # Skip cells with almost no ink.
     otsu = cv2.threshold(gray_cell, 0, 255,
                          cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
-    if np.count_nonzero(otsu) < 0.004 * otsu.size or gray_cell.std() < 8:
+    if np.count_nonzero(otsu) < 0.004 * otsu.size:
         return ""
 
     h, w = gray_cell.shape
-    scale = 3.0 if h < 40 else 2.0 if h < 90 else 1.0
-    if scale != 1.0:
+    # One resampling step only: make the cell ~110 px high (x1 .. x4).
+    scale = float(np.clip(110.0 / max(h, 1), 1.0, 4.0))
+    if scale > 1.05:
         gray_cell = cv2.resize(gray_cell, None, fx=scale, fy=scale,
                                interpolation=cv2.INTER_CUBIC)
     gray_cell = cv2.copyMakeBorder(gray_cell, 12, 12, 12, 12,
@@ -81,8 +91,8 @@ def _ocr_cell(gray_cell, lang):
 # ---------------------------------------------------------------------------
 # bordered tables
 # ---------------------------------------------------------------------------
-def _detect_cells(gray):
-    """Return list of (x, y, w, h) boxes of enclosed cells, or []."""
+def _grid_mask(gray):
+    """Binary mask (255 on ruling lines) or None when there are none."""
     h, w = gray.shape
     binary = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -101,14 +111,34 @@ def _detect_cells(gray):
     vertical = cv2.morphologyEx(
         vertical, cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(9, h // 120))))
-    grid = cv2.dilate(cv2.bitwise_or(horizontal, vertical),
+    # A table needs at least two long ruling lines in some direction;
+    # stray letter strokes must not be mistaken for a grid.
+    def long_lines(mask, axis_len, min_len):
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        return sum(1 for i in range(1, n)
+                   if stats[i, axis_len] >= min_len)
+
+    n_h = long_lines(horizontal, cv2.CC_STAT_WIDTH, 0.12 * w)
+    n_v = long_lines(vertical, cv2.CC_STAT_HEIGHT, 0.12 * h)
+    if n_h < 2 and n_v < 2:
+        return None
+
+    return cv2.dilate(cv2.bitwise_or(horizontal, vertical),
                       np.ones((3, 3), np.uint8))
 
-    if np.count_nonzero(grid) < 0.002 * grid.size:
-        return []
+
+def _detect_cells(grid):
+    """Return list of (x, y, w, h) boxes of enclosed cells, or []."""
+    sealed = grid.copy()
+    # Many tables have no outer border (e.g. no left edge). Draw the outline
+    # of everything that was detected so edge cells are closed, instead of
+    # leaking into the background and being thrown away.
+    ys, xs = np.where(grid > 0)
+    cv2.rectangle(sealed, (int(xs.min()), int(ys.min())),
+                  (int(xs.max()), int(ys.max())), 255, 3)
 
     # Frame the mask so cells touching the image edge are still closed.
-    framed = cv2.copyMakeBorder(grid, 3, 3, 3, 3,
+    framed = cv2.copyMakeBorder(sealed, 3, 3, 3, 3,
                                 cv2.BORDER_CONSTANT, value=255)
     inverted = cv2.bitwise_not(framed)
     count, _, stats, _ = cv2.connectedComponentsWithStats(inverted,
@@ -140,16 +170,24 @@ def _assign_grid(boxes):
     return [(_nearest(xs, b[0]), _nearest(ys, b[1])) for b in boxes]
 
 
-def _bordered_table(gray, lang):
-    boxes = _detect_cells(gray)
+def _crop_full(gray_full, box, scale, pad):
+    """Crop `box` (given in scaled coordinates) from the full-resolution
+    image, shrunk by `pad` scaled pixels on every side."""
+    x, y, w, h = box
+    x1, y1 = int((x + pad) / scale), int((y + pad) / scale)
+    x2, y2 = int((x + w - pad) / scale), int((y + h - pad) / scale)
+    return gray_full[max(0, y1):max(y1, y2), max(0, x1):max(x1, x2)]
+
+
+def _bordered_table(gray, gray_full, scale, lang, grid):
+    boxes = _detect_cells(grid) if grid is not None else []
     if not boxes:
         return None
     positions = _assign_grid(boxes)
 
-    crops = []
-    for (x, y, w, h) in boxes:
-        pad = 3
-        crops.append(gray[y + pad:y + h - pad, x + pad:x + w - pad])
+    # Crop from the original-resolution image (one resampling only) and
+    # keep clear of the ruling lines.
+    crops = [_crop_full(gray_full, b, scale, 5) for b in boxes]
 
     workers = min(8, (os.cpu_count() or 2))
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -166,7 +204,7 @@ def _bordered_table(gray, lang):
 # ---------------------------------------------------------------------------
 # borderless tables (best effort)
 # ---------------------------------------------------------------------------
-def _borderless_table(gray, lang):
+def _borderless_table(gray, gray_full, scale, lang):
     data = pytesseract.image_to_data(
         gray, lang=lang, config="--oem 1 --psm 6", output_type=Output.DICT)
 
@@ -182,14 +220,15 @@ def _borderless_table(gray, lang):
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
         lines.setdefault(key, []).append(
             (data["left"][i], data["top"][i],
-             data["width"][i], data["height"][i], text))
+             data["width"][i], data["height"][i], text, conf))
     if len(lines) < 2:
         return None
 
     heights = [w[3] for ws in lines.values() for w in ws]
-    gap_limit = 1.8 * float(np.median(heights))
+    med_h = float(np.median(heights))
+    gap_limit = 1.1 * med_h  # word gaps are ~0.3h, column gaps are >= ~1h
 
-    # Split every line into "cells" wherever there is a wide horizontal gap.
+    # Split every text line into "cells" wherever there is a wide gap.
     row_cells = []
     for key in sorted(lines, key=lambda k: min(w[1] for w in lines[k])):
         words = sorted(lines[key])
@@ -214,16 +253,70 @@ def _borderless_table(gray, lang):
         y2 = max(w[1] + w[3] for w in ws)
         return x1, y1, x2 - x1, y2 - y1
 
-    lefts = [box_of(c)[0] for cells in row_cells for c in cells]
-    col_centres = _cluster(lefts, 1.5 * float(np.median(heights)))
+    # Columns = horizontal ranges that cells overlap in. This copes with
+    # left-, right- and centre-aligned columns alike (unlike comparing the
+    # left edges). Very wide cells (titles) are ignored when building them.
+    spans = [(b[0], b[0] + b[2]) for cells in row_cells
+             for b in [box_of(c) for c in cells]]
+    table_w = max(e for _, e in spans) - min(s for s, _ in spans)
+    columns = []
+    for s, e in sorted(sp for sp in spans if sp[1] - sp[0] < 0.5 * table_w):
+        if columns and s <= columns[-1][1]:
+            columns[-1][1] = max(columns[-1][1], e)
+        else:
+            columns.append([s, e])
+    if len(columns) < 2:
+        return None
 
-    result = []
+    def column_of(box):
+        centre = box[0] + box[2] / 2
+        for i, (s, e) in enumerate(columns):
+            if s <= centre <= e:
+                return i
+        return int(np.argmin([abs(centre - (s + e) / 2) for s, e in columns]))
+
+    result = []                       # (pos, box, text, confidence)
     for r, cells in enumerate(row_cells):
         for ws in cells:
             box = box_of(ws)
-            col = _nearest(col_centres, box[0])
-            result.append(((col, r), box, " ".join(w[4] for w in ws)))
-    return result
+            result.append(((column_of(box), r), box,
+                           " ".join(w[4] for w in ws),
+                           float(np.mean([w[5] for w in ws]))))
+
+    # Geometry comes from the layout analysis; weak cells are read again on
+    # their own, and slots where a word was missed are filled in.
+    row_span = []
+    for cells in row_cells:
+        boxes = [box_of(c) for c in cells]
+        row_span.append((min(b[1] for b in boxes),
+                         max(b[1] + b[3] for b in boxes)))
+
+    jobs = []                         # (kind, pos, box, old_text)
+    for pos, box, text, conf in result:
+        if conf < 60:
+            jobs.append(("redo", pos, box, text))
+    present = {pos for pos, _, _, _ in result}
+    for r, (y1, y2) in enumerate(row_span):
+        for c, (s, e) in enumerate(columns):
+            if (c, r) not in present:
+                jobs.append(("fill", (c, r),
+                             (int(s), int(y1), int(e - s), int(y2 - y1)), ""))
+
+    def work(job):
+        kind, pos, (x, y, w, h), old = job
+        m = max(4, int(0.3 * h))
+        crop = _crop_full(gray_full, (x, y, w, h), scale, -m)
+        return kind, pos, (x, y, w, h), _ocr_cell(crop, lang) or old
+
+    workers = min(8, (os.cpu_count() or 2))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        done = list(pool.map(work, jobs))
+
+    final = {pos: (box, text) for pos, box, text, _ in result}
+    for kind, pos, box, text in done:
+        if text:
+            final[pos] = (box, text)
+    return [(pos, box, text) for pos, (box, text) in final.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +328,7 @@ def extract_tables_from_image(image_path, lang=None, allow_borderless=True):
     if image is None:
         raise ValueError(f"Could not read image: {image_path}")
 
-    gray = to_gray(image)
+    gray = to_gray(ensure_dark_on_light(image)[0])
     angle = estimate_skew(gray)
     if abs(angle) > 0.3:
         gray = rotate_keep_size(gray, angle, border=255)
@@ -255,11 +348,23 @@ def extract_tables_from_image(image_path, lang=None, allow_borderless=True):
     else:
         gray_s = gray
 
-    found = _bordered_table(gray_s, lang)
+    grid = _grid_mask(gray_s)
+    found = _bordered_table(gray_s, gray, scale, lang, grid)
     mode = "bordered"
-    if not found and allow_borderless:
-        found = _borderless_table(gray_s, lang)
-        mode = "borderless"
+
+    def n_cols(res):
+        return max(pos[0] for pos, _, _ in res) + 1
+
+    # Tables that only have row lines (or none at all) give <= 2 "columns"
+    # from the ruling lines; try the text-layout analysis on the page with
+    # the lines removed and keep whichever finds more columns.
+    if allow_borderless and (not found or n_cols(found) <= 2):
+        clean = gray_s.copy()
+        if grid is not None:
+            clean[cv2.dilate(grid, np.ones((3, 3), np.uint8)) > 0] = 255
+        alt = _borderless_table(clean, gray, scale, lang)
+        if alt and (not found or n_cols(alt) > n_cols(found)):
+            found, mode = alt, "borderless"
 
     annotated = image.copy()
     if not found:

@@ -1,0 +1,8 @@
+{
+  "images_evaluated": 499,
+  "exact_match_accuracy_%": 86.77,
+  "CER_%": 5.27,
+  "WER_%": 11.72,
+  "char_accuracy_%": 94.73,
+  "avg_edit_distance": 0.794
+}
