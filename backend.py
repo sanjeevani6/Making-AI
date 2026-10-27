@@ -340,6 +340,29 @@ def _clean_page(image):
     return gray, _remove_specks(ink)
 
 
+def _split_by_valleys(smooth, top, bottom, min_h, ratio=0.5):
+    """Recursively cut a tall band at pronounced dips of the row profile.
+
+    Cursive loops and descenders keep neighbouring lines from ever reaching
+    an empty row, so a plain "ink / no ink" threshold glues them together.
+    Here a cut is made at the lowest row if it is much weaker than the ink
+    on BOTH sides (both sides must also be at least `min_h` tall).
+    """
+    if bottom - top < 2 * min_h:
+        return [[top, bottom]]
+    seg = smooth[top + min_h:bottom - min_h + 1]
+    if seg.size == 0:
+        return [[top, bottom]]
+    pos = top + min_h + int(np.argmin(seg))
+    left, right = smooth[top:pos], smooth[pos:bottom]
+    if left.size == 0 or right.size == 0:
+        return [[top, bottom]]
+    if smooth[pos] < ratio * min(float(left.max()), float(right.max())):
+        return (_split_by_valleys(smooth, top, pos, min_h, ratio)
+                + _split_by_valleys(smooth, pos, bottom, min_h, ratio))
+    return [[top, bottom]]
+
+
 def segment_handwriting_lines(image):
     """Find text lines. Returns (clean_gray, [ [ (x1,y1,x2,y2), ... ], ... ])
     where each inner list holds the crop boxes of one text line."""
@@ -394,6 +417,14 @@ def segment_handwriting_lines(image):
                 trimmed.append([a + int(idx[0]), a + int(idx[-1]) + 1])
         final = trimmed
     else:
+        # Cut bands that hide several lines at pronounced profile dips.
+        med_h = float(np.median([b - t for t, b in merged]))
+        min_h = max(8, int(0.35 * med_h))
+        split_bands = []
+        for top, bottom in merged:
+            split_bands.extend(_split_by_valleys(smooth, top, bottom, min_h))
+        merged = split_bands
+
         heights = [b - t for t, b in merged]
         ref = float(pitch) if pitch else float(np.median(heights))
         can_split = pitch is not None or len(merged) >= 3

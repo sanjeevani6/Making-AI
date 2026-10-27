@@ -94,8 +94,28 @@ def needs_inversion(gray):
     return float(np.mean(gray <= t)) > 0.5
 
 
+def page_needs_inversion(gray):
+    """True only for a genuinely dark page (slides, dark-mode screenshots).
+
+    needs_inversion() alone is NOT safe for whole photos: Otsu may split
+    "lit paper" from "shadowed paper" and call the shadowed half the
+    background, which flipped normal grey notebook photos and destroyed
+    the text. A real light-on-dark page also has a dark MEDIAN and dark
+    border, so require those as well.
+    """
+    small = cv2.resize(gray, None, fx=0.25, fy=0.25,
+                       interpolation=cv2.INTER_AREA) \
+        if max(gray.shape[:2]) > 800 else gray
+    if float(np.median(small)) >= 100:
+        return False
+    border = np.concatenate([small[0], small[-1], small[:, 0], small[:, -1]])
+    if float(np.median(border)) >= 100:
+        return False
+    return needs_inversion(small)
+
+
 def ensure_dark_on_light(image):
     """Return (image, was_inverted) with dark text on a light background."""
-    if needs_inversion(to_gray(image)):
+    if page_needs_inversion(to_gray(image)):
         return cv2.bitwise_not(image), True
     return image, False

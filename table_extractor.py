@@ -226,25 +226,37 @@ def _borderless_table(gray, gray_full, scale, lang):
 
     heights = [w[3] for ws in lines.values() for w in ws]
     med_h = float(np.median(heights))
-    gap_limit = 1.1 * med_h  # word gaps are ~0.3h, column gaps are >= ~1h
+    # Word gaps inside a cell are ~0.3 x text height, gaps between columns
+    # are larger. (Splitting each text line on a big gap, as before, merged
+    # neighbouring columns of tightly packed tables - e.g. "Year" and
+    # "Gross" - so whole columns went missing.)
+    gap_min = 0.45 * med_h
 
-    # Split every text line into "cells" wherever there is a wide gap.
-    row_cells = []
-    for key in sorted(lines, key=lambda k: min(w[1] for w in lines[k])):
-        words = sorted(lines[key])
-        cells, cur = [], [words[0]]
-        for prev, nxt in zip(words, words[1:]):
-            if nxt[0] - (prev[0] + prev[2]) > gap_limit:
-                cells.append(cur)
-                cur = [nxt]
-            else:
-                cur.append(nxt)
-        cells.append(cur)
-        row_cells.append(cells)
+    ordered = sorted(lines, key=lambda k: min(w[1] for w in lines[k]))
+    line_words = [sorted(lines[k]) for k in ordered]
 
-    # Need a repeated multi-column structure to call it a table.
-    if sum(len(c) >= 2 for c in row_cells) < max(2, len(row_cells) // 2):
+    def has_gap(ws):
+        return any(n[0] - (p[0] + p[2]) >= gap_min for p, n in zip(ws, ws[1:]))
+
+    # Only lines that show a column gap vote on where the columns are, so a
+    # title or a paragraph above the table cannot glue the columns together.
+    gap_lines = [ws for ws in line_words if has_gap(ws)]
+    if len(gap_lines) < max(2, len(line_words) // 2):
         return None
+
+    def n_cells(ws):
+        return 1 + sum(n[0] - (p[0] + p[2]) >= gap_min
+                       for p, n in zip(ws, ws[1:]))
+
+    # Headers are often wider than their data and overlap the neighbouring
+    # column, so the columns are measured on the typical data rows only
+    # (the lines with the most common number of cells). Other lines are
+    # assigned to the nearest column afterwards.
+    counts = [n_cells(ws) for ws in gap_lines]
+    mode = max(set(counts), key=lambda c: (counts.count(c), c))
+    voting = [ws for ws, c in zip(gap_lines, counts) if c == mode]
+    if len(voting) < 2:
+        voting = gap_lines
 
     def box_of(ws):
         x1 = min(w[0] for w in ws)
@@ -253,43 +265,60 @@ def _borderless_table(gray, gray_full, scale, lang):
         y2 = max(w[1] + w[3] for w in ws)
         return x1, y1, x2 - x1, y2 - y1
 
-    # Columns = horizontal ranges that cells overlap in. This copes with
-    # left-, right- and centre-aligned columns alike (unlike comparing the
-    # left edges). Very wide cells (titles) are ignored when building them.
-    spans = [(b[0], b[0] + b[2]) for cells in row_cells
-             for b in [box_of(c) for c in cells]]
-    table_w = max(e for _, e in spans) - min(s for s, _ in spans)
+    # Columns = x-ranges covered by words of the voting lines (union of the
+    # word spans, bridged across ordinary word gaps). Works for left-,
+    # right- and centre-aligned columns alike.
+    half = gap_min / 2.0
+    spans = sorted((w[0] - half, w[0] + w[2] + half)
+                   for ws in voting for w in ws)
     columns = []
-    for s, e in sorted(sp for sp in spans if sp[1] - sp[0] < 0.5 * table_w):
-        if columns and s <= columns[-1][1]:
-            columns[-1][1] = max(columns[-1][1], e)
+    for s_, e_ in spans:
+        if columns and s_ < columns[-1][1]:
+            columns[-1][1] = max(columns[-1][1], e_)
         else:
-            columns.append([s, e])
+            columns.append([s_, e_])
+    columns = [[s_ + half, e_ - half] for s_, e_ in columns]
     if len(columns) < 2:
         return None
 
     def column_of(box):
-        centre = box[0] + box[2] / 2
-        for i, (s, e) in enumerate(columns):
-            if s <= centre <= e:
-                return i
-        return int(np.argmin([abs(centre - (s + e) / 2) for s, e in columns]))
+        """Column with the largest horizontal overlap with `box`; if none
+        overlaps, the nearest one."""
+        x1, x2 = box[0], box[0] + box[2]
+        overlaps = [min(x2, e_) - max(x1, s_) for s_, e_ in columns]
+        if max(overlaps) > 0:
+            return int(np.argmax(overlaps))
+        return int(np.argmin([min(abs(x1 - e_), abs(x2 - s_))
+                              for s_, e_ in columns]))
+
+    def split_cells(ws):
+        cells, cur = [], [ws[0]]
+        for p, n in zip(ws, ws[1:]):
+            if n[0] - (p[0] + p[2]) >= gap_min:
+                cells.append(cur)
+                cur = [n]
+            else:
+                cur.append(n)
+        cells.append(cur)
+        return cells
 
     result = []                       # (pos, box, text, confidence)
-    for r, cells in enumerate(row_cells):
-        for ws in cells:
-            box = box_of(ws)
-            result.append(((column_of(box), r), box,
-                           " ".join(w[4] for w in ws),
-                           float(np.mean([w[5] for w in ws]))))
+    for r, ws in enumerate(line_words):
+        by_col = {}
+        # whole cells (not single words) are assigned, so "New Moon" can
+        # never be torn apart by a neighbouring column.
+        for cell in split_cells(ws):
+            by_col.setdefault(column_of(box_of(cell)), []).extend(cell)
+        for c, cws in by_col.items():
+            cws = sorted(cws)
+            result.append(((c, r), box_of(cws),
+                           " ".join(w[4] for w in cws),
+                           float(np.mean([w[5] for w in cws]))))
 
     # Geometry comes from the layout analysis; weak cells are read again on
     # their own, and slots where a word was missed are filled in.
-    row_span = []
-    for cells in row_cells:
-        boxes = [box_of(c) for c in cells]
-        row_span.append((min(b[1] for b in boxes),
-                         max(b[1] + b[3] for b in boxes)))
+    row_span = [(min(w[1] for w in ws), max(w[1] + w[3] for w in ws))
+                for ws in line_words]
 
     jobs = []                         # (kind, pos, box, old_text)
     for pos, box, text, conf in result:
