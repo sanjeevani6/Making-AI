@@ -1,154 +1,172 @@
+"""Evaluate the OCR pipeline on a labelled dataset.
+
+dataset/img/<id>.png|jpg   images
+dataset/text/<id>.txt      ground-truth text
+
+Examples
+    python test_model.py                         # printed, word images
+    python test_model.py --mode handwritten
+    python test_model.py --psm 7 6 --limit 200 --show
+Outputs: results/summary.json, results/predictions.csv, results/confusions.png
+"""
+import argparse
+import json
 import os
-import numpy as np
+from collections import Counter
+
 import pandas as pd
-import seaborn as sns
-from backend import extract_text, preprocess_image
+from rapidfuzz.distance import Levenshtein
 from tqdm import tqdm
-from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
-import matplotlib
-import matplotlib.pyplot as plt
 
-# Set matplotlib backend
-matplotlib.use('TkAgg')
+import backend
 
-# Dataset paths
-img_dir = 'dataset/img'
-gt_dir = 'dataset/text'
 
-# File list
-image_files = sorted([f for f in os.listdir(img_dir) if f.endswith(('.jpg', '.png', '.jpeg'))])
-total = len(image_files)
-print(f"Total images: {total}")
+def normalize(text, lowercase=True):
+    text = " ".join(text.split())          # collapse all whitespace
+    return text.lower() if lowercase else text
 
-# Evaluation stats
-correct_words = 0
-total_chars = 0
-correct_chars = 0
-lev_dist_sum = 0
-y_true_chars = []
-y_pred_chars = []
 
-# Additional metrics
-lev_distances = []
-word_lengths = []
-is_correct = []
-wrong_predictions = []  # To store details of incorrect predictions
+def evaluate(img_dir, gt_dir, mode="printed", psms=(8, 7, 6),
+             limit=None, lowercase=True):
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    files = sorted(f for f in os.listdir(img_dir) if f.lower().endswith(exts))
+    if limit:
+        files = files[:limit]
+    print(f"Images found: {len(files)}")
 
-for img_file in tqdm(image_files, total=total):
-    img_path = os.path.join(img_dir, img_file)
-    file_id = os.path.splitext(img_file)[0]
-    gt_path = os.path.join(gt_dir, f"{file_id}.txt")
+    rows = []
+    confusions = Counter()
+    tot_chars = tot_char_err = tot_words = tot_word_err = 0
 
-    if not os.path.exists(gt_path):
-        print(f"Missing ground truth for: {img_file}")
-        continue
+    for name in tqdm(files):
+        stem = os.path.splitext(name)[0]
+        gt_path = os.path.join(gt_dir, stem + ".txt")
+        if not os.path.exists(gt_path):
+            print(f"Missing ground truth: {name}")
+            continue
+        with open(gt_path, encoding="utf-8") as f:
+            gt = normalize(f.read(), lowercase)
 
-    with open(gt_path, 'r', encoding='utf-8') as f:
-        gt = f.read().strip().lower()
+        img_path = os.path.join(img_dir, name)
+        conf = None
+        if mode == "printed":
+            _, processed, _ = backend.preprocess_image(img_path)
+            if processed is None:
+                print(f"Could not read: {name}")
+                continue
+            pred, conf, _ = backend.extract_text_with_confidence(
+                processed, psms=psms)
+        else:
+            pred = backend.extract_handwritten_text_by_line(img_path)
+            if pred == "No handwriting detected.":
+                pred = ""
+        pred = normalize(pred, lowercase)
 
-    _, processed, _ = preprocess_image(img_path)
-    if processed is None:
-        print(f"Failed to process image: {img_file}")
-        continue
+        # Character errors (edit distance) - the standard CER definition.
+        char_err = Levenshtein.distance(pred, gt)
+        tot_chars += len(gt)
+        tot_char_err += char_err
 
-    pred = extract_text(processed).strip().lower()
+        # Word errors (edit distance over word tokens) - the standard WER.
+        gt_w, pr_w = gt.split(), pred.split()
+        word_err = Levenshtein.distance(pr_w, gt_w)
+        tot_words += len(gt_w)
+        tot_word_err += word_err
 
-    print("Predicted: ", pred)
-    print("Actual: ", gt)
+        # Which characters get confused? (from the edit operations)
+        for op in Levenshtein.editops(gt, pred):
+            if op.tag == "replace":
+                confusions[(gt[op.src_pos], pred[op.dest_pos])] += 1
+            elif op.tag == "delete":
+                confusions[(gt[op.src_pos], "∅")] += 1
+            else:
+                confusions[("∅", pred[op.dest_pos])] += 1
 
-    # Word-level accuracy
-    word_correct = pred == gt
-    if word_correct:
-        correct_words += 1
-    else:
-        wrong_predictions.append({
-            'filename': img_file,
-            'predicted': pred,
-            'ground_truth': gt
-        })
+        rows.append({"file": name, "ground_truth": gt, "prediction": pred,
+                     "exact": pred == gt, "char_errors": char_err,
+                     "cer": char_err / max(len(gt), 1),
+                     "confidence": conf})
 
-    # Character-level stats
-    correct_chars += sum(p == g for p, g in zip(pred, gt))
-    total_chars += len(gt)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise SystemExit("Nothing was evaluated - check the dataset paths.")
 
-    # Levenshtein distance
-    def levenshtein_distance(s1, s2):
-        len_s1, len_s2 = len(s1), len(s2)
-        dp = np.zeros((len_s1 + 1, len_s2 + 1), dtype=int)
-        for i in range(len_s1 + 1):
-            dp[i][0] = i
-        for j in range(len_s2 + 1):
-            dp[0][j] = j
-        for i in range(1, len_s1 + 1):
-            for j in range(1, len_s2 + 1):
-                cost = 0 if s1[i - 1] == s2[j - 1] else 1
-                dp[i][j] = min(dp[i - 1][j] + 1,
-                               dp[i][j - 1] + 1,
-                               dp[i - 1][j - 1] + cost)
-        return dp[len_s1][len_s2]
+    summary = {
+        "images_evaluated": int(len(df)),
+        "exact_match_accuracy_%": round(100 * df["exact"].mean(), 2),
+        "CER_%": round(100 * tot_char_err / max(tot_chars, 1), 2),
+        "WER_%": round(100 * tot_word_err / max(tot_words, 1), 2),
+        "char_accuracy_%": round(
+            100 * (1 - tot_char_err / max(tot_chars, 1)), 2),
+        "avg_edit_distance": round(df["char_errors"].mean(), 3),
+    }
+    return df, summary, confusions
 
-    lev_dist = levenshtein_distance(pred, gt)
-    lev_dist_sum += lev_dist
-    lev_distances.append(lev_dist)
 
-    # Pad strings
-    max_len = max(len(gt), len(pred))
-    gt_padded = gt.ljust(max_len)
-    pred_padded = pred.ljust(max_len)
+def plot_confusions(confusions, path, top=25, show=False):
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    y_true_chars.extend(list(gt_padded))
-    y_pred_chars.extend(list(pred_padded))
-
-    # Word length stats
-    word_lengths.append(len(gt))
-    is_correct.append(1 if word_correct else 0)
-
-# Clean padding-only characters
-filtered = [(t, p) for t, p in zip(y_true_chars, y_pred_chars) if t.strip() != '' or p.strip() != '']
-y_true_chars, y_pred_chars = zip(*filtered) if filtered else ([], [])
-
-# Final calculations
-word_accuracy = (correct_words / total) * 100
-char_accuracy = (correct_chars / total_chars) * 100 if total_chars > 0 else 0
-avg_lev_distance = lev_dist_sum / total if total > 0 else 0
-
-# Precision, Recall, F1
-precision = precision_score(y_true_chars, y_pred_chars, average='micro', zero_division=0)
-recall = recall_score(y_true_chars, y_pred_chars, average='micro', zero_division=0)
-f1 = f1_score(y_true_chars, y_pred_chars, average='micro', zero_division=0)
-
-# Print metrics
-print("\n📊 OCR Evaluation Metrics:")
-print(f"✅ Word-Level Accuracy:     {word_accuracy:.2f}%")
-print(f"🔠 Character-Level Accuracy: {char_accuracy:.2f}%")
-print(f"✏ Avg Levenshtein Distance: {avg_lev_distance:.2f}")
-print(f"🎯 Precision:                {precision:.4f}")
-print(f"📈 Recall:                   {recall:.4f}")
-print(f"🏆 F1 Score:                 {f1:.4f}")
-
-# Print detailed wrong predictions
-if wrong_predictions:
-    print("\n❌ Incorrect Predictions:")
-    for item in wrong_predictions:
-        print(f"\n🖼️ Image: {item['filename']}")
-        print(f"🔮 Predicted:     {item['predicted']}")
-        print(f"📌 Ground Truth:  {item['ground_truth']}")
-else:
-    print("\n✅ All predictions were correct!")
-
-# Character Confusion Matrix
-if len(set(y_true_chars)) <= 100:
-    chars = sorted(set(y_true_chars))
-    cm = confusion_matrix(y_true_chars, y_pred_chars, labels=chars)
-
-    plt.figure(figsize=(12, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=chars, yticklabels=chars,
-                cbar_kws={'label': 'Number of Errors'})
-    plt.title('Character Confusion Matrix', fontweight='bold')
-    plt.xlabel('Predicted Characters')
-    plt.ylabel('True Characters')
-    plt.xticks(rotation=45)
-    plt.yticks(rotation=0)
+    if not confusions:
+        return
+    items = confusions.most_common(top)
+    labels = [f"'{a}' → '{b}'" for (a, b), _ in items][::-1]
+    counts = [c for _, c in items][::-1]
+    plt.figure(figsize=(8, 0.35 * len(items) + 1.5))
+    plt.barh(labels, counts, color="#3B6FD4")
+    plt.xlabel("Count")
+    plt.title(f"Top {len(items)} character confusions (truth → predicted)")
     plt.tight_layout()
-    plt.show()
+    plt.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--img-dir", default="dataset/img")
+    ap.add_argument("--gt-dir", default="dataset/text")
+    ap.add_argument("--mode", choices=["printed", "handwritten"],
+                    default="printed")
+    ap.add_argument("--psm", type=int, nargs="+", default=[8, 7, 6],
+                    help="Tesseract page-segmentation modes to try "
+                         "(8/7 = single word/line, 6 = block, 3 = page)")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--keep-case", action="store_true",
+                    help="case-sensitive comparison")
+    ap.add_argument("--out-dir", default="results")
+    ap.add_argument("--show", action="store_true",
+                    help="open the confusion chart in a window")
+    args = ap.parse_args()
+
+    df, summary, confusions = evaluate(
+        args.img_dir, args.gt_dir, args.mode, tuple(args.psm),
+        args.limit, not args.keep_case)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    df.to_csv(os.path.join(args.out_dir, "predictions.csv"),
+              index=False, encoding="utf-8-sig")
+    with open(os.path.join(args.out_dir, "summary.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    plot_confusions(confusions, os.path.join(args.out_dir, "confusions.png"),
+                    show=args.show)
+
+    print("\nOCR evaluation")
+    for k, v in summary.items():
+        print(f"  {k:<26}{v}")
+
+    wrong = df[~df["exact"]]
+    print(f"\n{len(wrong)} incorrect predictions (first 20):")
+    for _, r in wrong.head(20).iterrows():
+        print(f"  {r['file']}: predicted={r['prediction']!r} "
+              f"truth={r['ground_truth']!r}")
+    print(f"\nFull report saved in '{args.out_dir}/'")
+
+
+if __name__ == "__main__":
+    main()

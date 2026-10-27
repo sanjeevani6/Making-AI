@@ -10,3 +10,12 @@ frontend.py
 extracted_text.txt
 __pycache__
 __pycache__/table_extractor.cpython-311.pyc
+# Python virtual environment
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Local environment variables
+.env

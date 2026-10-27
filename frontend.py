@@ -1,228 +1,594 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
-from PIL import Image, ImageTk
-import cv2
-import backend
-from table_extractor import extract_tables_from_image, cells_to_csv
+
 import os
+import queue
+import threading
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+import cv2
+from PIL import Image
+
+import backend
+from image_utils import read_image
+from table_extractor import (
+    cells_to_file, cells_to_grid, extract_tables_from_image,
+)
 from reportlab.lib.pagesizes import letter
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import simpleSplit
 
-class OCRApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("OCR Document Scanner")
-        self.root.geometry("1000x750")
-        self.root.geometry("1000x750")
-        self.root.configure(bg="white")
+
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+
+
+class OCRApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("DocuScan | OCR Workspace")
+        self.geometry("1250x800")
+        self.minsize(1000, 650)
+        self.configure(fg_color="#F4F6FA")
 
         self.image_path = None
+        self.original_image = None
         self.processed_image = None
-        self.gray_image = None
+        self.current_text = ""
+        self.current_mode = "Printed OCR"
+        self.busy = False
+        self.table_cells = []
+        self.result_queue = queue.Queue()
+        self.mode_buttons = {}
+        self.pdf_font = self._register_pdf_font()
 
-        # Sidebar Frame
-        sidebar_frame = tk.Frame(root, bg="white", width=200, height=750)
-        sidebar_frame.pack(side=tk.LEFT, fill=tk.Y)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        self.upload_btn = tk.Button(sidebar_frame, text="📂 Upload Image", command=self.upload_image)
-        self.upload_btn.pack(pady=5, fill=tk.X)
+        self._build_sidebar()
+        self._build_workspace()
+        self._set_status("Ready to upload a document")
+        self._highlight_mode()
 
-        self.process_btn = tk.Button(sidebar_frame, text="🛠 Process Image", command=self.process_image, state=tk.DISABLED)
-        self.process_btn.pack(pady=5, fill=tk.X)
+    @staticmethod
+    def _register_pdf_font():
+        """Use a Unicode TrueType font in PDFs when one is available."""
+        candidates = [
+            r"C:\Windows\Fonts\arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    pdfmetrics.registerFont(TTFont("DocuFont", path))
+                    return "DocuFont"
+                except Exception:
+                    pass
+        return "Helvetica"
 
-        self.handwriting_btn = tk.Button(sidebar_frame, text="📝 Read Handwriting", command=self.process_handwriting_image, state=tk.DISABLED)
-        self.handwriting_btn.pack(pady=5, fill=tk.X)
+    def _build_sidebar(self):
+        self.sidebar = ctk.CTkFrame(
+            self, width=220, corner_radius=0,
+            fg_color="#182235"
+        )
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_propagate(False)
 
-        self.extract_table_btn = tk.Button(sidebar_frame, text="🧾 Extract Table", command=self.extract_table, state=tk.DISABLED)
-        self.extract_table_btn.pack(pady=5, fill=tk.X)
+        ctk.CTkLabel(
+            self.sidebar,
+            text="▣  DocuScan",
+            font=("Segoe UI", 25, "bold"),
+            text_color="white"
+        ).pack(padx=20, pady=(28, 6), anchor="w")
 
-        # Main Frame for image and text display
-        main_frame = tk.Frame(root, bg="white")
-        main_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        ctk.CTkLabel(
+            self.sidebar,
+            text="DOCUMENT WORKSPACE",
+            font=("Segoe UI", 10, "bold"),
+            text_color="#9BAAC2"
+        ).pack(padx=22, pady=(0, 28), anchor="w")
 
-        # Image Display Frame
-        img_frame = tk.Frame(main_frame, bg="white")
-        img_frame.pack(pady=20, fill=tk.X)
+        self._nav_button("＋  Upload Document", self.upload_image)
+        self.mode_buttons["Printed OCR"] = self._nav_button(
+            "▤  Printed Text OCR",
+            lambda: self.select_mode("Printed OCR"))
+        self.mode_buttons["Handwriting OCR"] = self._nav_button(
+            "✎  Handwriting OCR",
+            lambda: self.select_mode("Handwriting OCR"))
+        self.mode_buttons["Table Extraction"] = self._nav_button(
+            "▦  Table Extraction",
+            lambda: self.select_mode("Table Extraction"))
 
-        self.orig_label = tk.Label(img_frame, text="Original Image", fg="black", font=("Arial", 12, "bold"))
-        self.orig_label.grid(row=0, column=0, padx=20)
+        ctk.CTkFrame(
+            self.sidebar, height=1, fg_color="#344158"
+        ).pack(fill="x", padx=18, pady=22)
 
-        self.proc_label = tk.Label(img_frame, text="Processed Image", fg="black", font=("Arial", 12, "bold"))
-        self.proc_label.grid(row=0, column=1, padx=20)
+        ctk.CTkLabel(
+            self.sidebar,
+            text="EXPORT RESULTS",
+            font=("Segoe UI", 10, "bold"),
+            text_color="#9BAAC2"
+        ).pack(padx=22, pady=(0, 10), anchor="w")
 
-        self.orig_img_display = tk.Label(img_frame, bg="white")
-        self.orig_img_display.grid(row=1, column=0, padx=20)
+        self._nav_button("↓  Save Text", self.save_text)
+        self._nav_button("▧  Export PDF", self.save_pdf)
+        self._nav_button("▦  Export Table (CSV/XLSX)", self.save_table)
+        self._nav_button("▣  Save Processed Image", self.save_image)
 
-        self.proc_img_display = tk.Label(img_frame, bg="white")
-        self.proc_img_display.grid(row=1, column=1, padx=20)
+        ctk.CTkLabel(
+            self.sidebar,
+            text="OCR Document Scanner\nTesseract · TrOCR",
+            text_color="#9BAAC2",
+            font=("Segoe UI", 11),
+            justify="left"
+        ).pack(side="bottom", padx=20, pady=24, anchor="w")
 
-        # Text Area for extracted text
-        self.text_area = scrolledtext.ScrolledText(main_frame, height=10, width=80, wrap=tk.WORD)
-        self.text_area.pack(pady=20)
+    def _nav_button(self, text, command):
+        button = ctk.CTkButton(
+            self.sidebar,
+            text=text,
+            command=command,
+            height=42,
+            corner_radius=9,
+            anchor="w",
+            fg_color="transparent",
+            hover_color="#2A3850",
+            text_color="#E8EDF5",
+            font=("Segoe UI", 13)
+        )
+        button.pack(fill="x", padx=12, pady=3)
+        return button
 
-        # Save and Copy Buttons
-        save_button_frame = tk.Frame(main_frame, bg="white")
-        save_button_frame.pack(pady=10)
+    def _highlight_mode(self):
+        for mode, button in self.mode_buttons.items():
+            active = mode == self.current_mode
+            button.configure(fg_color="#2F4B7C" if active else "transparent")
 
-        self.save_text_btn = tk.Button(save_button_frame, text="💾 Save Text", command=self.save_text, state=tk.DISABLED)
-        self.save_text_btn.grid(row=0, column=0, padx=5)
+    def _build_workspace(self):
+        self.workspace = ctk.CTkFrame(
+            self, corner_radius=0, fg_color="#F4F6FA"
+        )
+        self.workspace.grid(
+            row=0, column=1, sticky="nsew", padx=24, pady=20
+        )
+        self.workspace.grid_columnconfigure((0, 1), weight=1)
+        self.workspace.grid_rowconfigure(2, weight=3)
+        self.workspace.grid_rowconfigure(4, weight=2)
 
-        self.copy_text_btn = tk.Button(save_button_frame, text="📋 Copy Text", command=self.copy_text, state=tk.DISABLED)
-        self.copy_text_btn.grid(row=0, column=1, padx=5)
+        # Header
+        header = ctk.CTkFrame(
+            self.workspace, fg_color="transparent"
+        )
+        header.grid(row=0, column=0, columnspan=2,
+                    sticky="ew", pady=(0, 16))
+        header.grid_columnconfigure(0, weight=1)
 
-        self.save_img_btn = tk.Button(save_button_frame, text="💾 Save Image", command=self.save_image, state=tk.DISABLED)
-        self.save_img_btn.grid(row=0, column=2, padx=5)
+        ctk.CTkLabel(
+            header,
+            text="OCR Workspace",
+            font=("Segoe UI", 27, "bold"),
+            text_color="#182235"
+        ).grid(row=0, column=0, sticky="w")
 
-        self.save_pdf_btn = tk.Button(save_button_frame, text="📄 Save as PDF", command=self.save_as_pdf, state=tk.DISABLED)
-        self.save_pdf_btn.grid(row=0, column=3, padx=5)
+        self.mode_label = ctk.CTkLabel(
+            header, text="Mode: Printed OCR",
+            font=("Segoe UI", 12),
+            text_color="#53627A"
+        )
+        self.mode_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        self.process_btn = ctk.CTkButton(
+            header, text="▶  Process Document",
+            command=self.process_document,
+            width=190, height=42, corner_radius=10
+        )
+        self.process_btn.grid(row=0, column=1, rowspan=2, padx=8)
+
+        self.upload_btn = ctk.CTkButton(
+            header, text="＋ Upload",
+            command=self.upload_image,
+            width=110, height=42, corner_radius=10,
+            fg_color="#FFFFFF", hover_color="#E8EDF5",
+            text_color="#182235",
+            border_width=1, border_color="#D8DFEA"
+        )
+        self.upload_btn.grid(row=0, column=2, rowspan=2)
+
+        # Status bar
+        self.status_label = ctk.CTkLabel(
+            self.workspace, text="Ready",
+            anchor="w", height=30,
+            fg_color="#E7ECF5", corner_radius=8,
+            text_color="#465570"
+        )
+        self.status_label.grid(
+            row=1, column=0, columnspan=2,
+            sticky="ew", pady=(0, 14)
+        )
+
+        # Image panels
+        self.original_panel = self._image_panel(
+            self.workspace, "Original Document"
+        )
+        self.original_panel.grid(
+            row=2, column=0, sticky="nsew", padx=(0, 8), pady=4
+        )
+
+        self.processed_panel = self._image_panel(
+            self.workspace, "Processed Document"
+        )
+        self.processed_panel.grid(
+            row=2, column=1, sticky="nsew", padx=(8, 0), pady=4
+        )
+
+        # Results header
+        result_header = ctk.CTkFrame(
+            self.workspace, fg_color="transparent"
+        )
+        result_header.grid(
+            row=3, column=0, columnspan=2,
+            sticky="ew", pady=(15, 6)
+        )
+        result_header.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            result_header, text="Recognized Text",
+            font=("Segoe UI", 18, "bold"),
+            text_color="#182235"
+        ).grid(row=0, column=0, sticky="w")
+
+        self.copy_btn = ctk.CTkButton(
+            result_header, text="Copy",
+            width=75, height=30,
+            command=self.copy_text
+        )
+        self.copy_btn.grid(row=0, column=1, padx=4)
+
+        self.clear_btn = ctk.CTkButton(
+            result_header, text="Clear",
+            width=75, height=30,
+            command=self.clear_text,
+            fg_color="#FFFFFF", hover_color="#E8EDF5",
+            text_color="#182235",
+            border_width=1, border_color="#D8DFEA"
+        )
+        self.clear_btn.grid(row=0, column=2, padx=(4, 0))
+
+        self.text_box = ctk.CTkTextbox(
+            self.workspace,
+            corner_radius=10,
+            border_width=1,
+            border_color="#D8DFEA",
+            fg_color="#FFFFFF",
+            text_color="#182235",
+            font=("Consolas", 13),
+            wrap="word"
+        )
+        self.text_box.grid(
+            row=4, column=0, columnspan=2,
+            sticky="nsew", pady=(0, 8)
+        )
+
+    def _image_panel(self, parent, title):
+        panel = ctk.CTkFrame(
+            parent, corner_radius=12,
+            fg_color="#FFFFFF",
+            border_width=1, border_color="#E0E5EE"
+        )
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            panel, text=title,
+            font=("Segoe UI", 14, "bold"),
+            text_color="#344158"
+        ).grid(row=0, column=0, padx=14, pady=12, sticky="w")
+
+        image_label = ctk.CTkLabel(
+            panel,
+            text="Upload an image to preview it",
+            font=("Segoe UI", 13),
+            text_color="#8A96A9",
+            fg_color="#F7F9FC",
+            corner_radius=8
+        )
+        image_label.grid(
+            row=1, column=0, sticky="nsew",
+            padx=12, pady=(0, 12)
+        )
+        panel.image_label = image_label
+        return panel
+
+    def _set_status(self, message):
+        self.status_label.configure(text=f"  {message}")
+        self.update_idletasks()
+
+    def select_mode(self, mode):
+        self.current_mode = mode
+        self.mode_label.configure(text=f"Mode: {mode}")
+        self._highlight_mode()
+        self._set_status(f"Selected {mode}")
 
     def upload_image(self):
-        # Upload and display the original image
-        file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg")])
-        if not file_path:
-            return
-        
-        self.image_path = file_path
-        self.display_image(file_path, self.orig_img_display)
-
-        self.process_btn.config(state=tk.NORMAL)
-        self.handwriting_btn.config(state=tk.NORMAL)
-        self.extract_table_btn.config(state=tk.NORMAL)
-
-    def process_handwriting_image(self):
-        if not self.image_path:
+        path = filedialog.askopenfilename(
+            title="Select a document image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
+                ("All files", "*.*")
+            ]
+        )
+        if not path:
             return
 
-        result = backend.handle_user_choice(self.image_path, 'handwritten')
-        text = result['text']
-        self.text_area.delete("1.0", tk.END)
-        self.text_area.insert(tk.END, text)
-
-        self.save_text_btn.config(state=tk.NORMAL)
-        self.copy_text_btn.config(state=tk.NORMAL)
-        self.save_img_btn.config(state=tk.DISABLED)  # No processed image for handwritten
-        self.save_pdf_btn.config(state=tk.NORMAL)
-
-    def extract_table(self):
-        if not self.image_path:
-            messagebox.showerror("Error", "No image to extract table from.")
+        image = read_image(path)
+        if image is None:
+            messagebox.showerror(
+                "Invalid image", "The selected file could not be opened."
+            )
             return
 
-        output_img, table_cells = extract_tables_from_image(self.image_path)
+        self.image_path = path
+        self.original_image = image
+        self.processed_image = None
+        self.table_cells = []
+        self._show_cv_image(image, self.original_panel.image_label)
+        self.processed_panel.image_label.configure(
+            image=None, text="Process the document to see the result."
+        )
+        self.clear_text()
+        self._set_status(f"Loaded: {os.path.basename(path)}")
 
-        if not table_cells:
-            messagebox.showinfo("Info", "No tables detected.")
+    def _show_cv_image(self, image, label):
+        if image is None:
+            label.configure(image=None, text="No image available.")
+            label.image = None
             return
 
-        # Table Viewer Window
-        table_window = tk.Toplevel(self.root)
-        table_window.title("Extracted Table Text")
-
-        table_text = tk.Text(table_window, wrap=tk.WORD, width=80, height=25)
-        table_text.pack(padx=10, pady=10)
-
-        sorted_cells = sorted(table_cells, key=lambda item: (item[0][1], item[0][0]))
-        last_y = -1000
-        for ((x, y), text) in sorted_cells:
-            if abs(y - last_y) > 15:
-                table_text.insert(tk.END, "\n")
-            table_text.insert(tk.END, text + "\t")
-            last_y = y
-
-        save_csv = messagebox.askyesno("Save Table", "Do you want to save the table as CSV?")
-        if save_csv:
-            from datetime import datetime
-            filename = f"table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            cells_to_csv(table_cells, filename)
-            messagebox.showinfo("Saved", f"Table saved as {filename}")
-
-    def process_image(self):
-        # General image preprocessing (for normal OCR)
-        if not self.image_path:
-            return
-
-        gray, processed, _, text = backend.process_and_extract(self.image_path)
-
-        if processed is not None:
-            self.gray_image = gray
-            self.processed_image = processed
-
-            cv2.imwrite("processed_output.png", processed)
-            self.display_image("processed_output.png", self.proc_img_display)
-
-            self.text_area.delete("1.0", tk.END)
-            self.text_area.insert(tk.END, text)
-
-            self.save_text_btn.config(state=tk.NORMAL)
-            self.copy_text_btn.config(state=tk.NORMAL)
-            self.save_img_btn.config(state=tk.NORMAL)
-            self.save_pdf_btn.config(state=tk.NORMAL)
-            self.save_text_btn.config(state=tk.NORMAL)
-            self.copy_text_btn.config(state=tk.NORMAL)
-            self.save_img_btn.config(state=tk.NORMAL)
-            self.save_pdf_btn.config(state=tk.NORMAL)
+        if len(image.shape) == 2:
+            # Grayscale images, such as the handwriting preprocessing preview.
+            rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         else:
-            messagebox.showerror("Error", "Could not process the image.")
+            # OpenCV color images use BGR; PIL expects RGB.
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    def display_image(self, path, label):
-        # Display an image in a Tkinter label
-        img = Image.open(path)
-        img.thumbnail((400, 400))
-        img = ImageTk.PhotoImage(img)
-        label.config(image=img)
-        label.image = img  # Keep a reference
+        pil_image = Image.fromarray(rgb)
+        pil_image.thumbnail((560, 320))
+        photo = ctk.CTkImage(
+            light_image=pil_image,
+            dark_image=pil_image,
+            size=pil_image.size
+        )
+        label.configure(image=photo, text="")
+        label.image = photo
 
-    def save_text(self):
-        # Save extracted text to a file
-        file_path = filedialog.asksaveasfilename(defaultextension=".txt",
-                                                 filetypes=[("Text files", "*.txt")])
-        if not file_path:
+ 
+    # ------------------------------------------------------------------
+    # Processing runs in a worker thread so the window never freezes.
+    # The worker never touches widgets; it reports through a queue.
+    # ------------------------------------------------------------------
+    def process_document(self):
+        if self.busy:
             return
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(self.text_area.get("1.0", tk.END))
+
+        if not self.image_path:
+            messagebox.showinfo(
+                "Upload document",
+                "Please upload an image first."
+            )
+            return
+
+        self.busy = True
+        self.process_btn.configure(state="disabled")
+        first_use = " (the first run loads the model, please wait)" \
+            if self.current_mode == "Handwriting OCR" else ""
+        self._set_status(f"Processing with {self.current_mode}...{first_use}")
+
+        threading.Thread(
+            target=self._worker,
+            args=(self.current_mode, self.image_path),
+            daemon=True
+        ).start()
+        self.after(100, self._poll_worker)
+
+    def _worker(self, mode, path):
+        try:
+            if mode == "Printed OCR":
+                result = backend.handle_user_choice(path, "printed")
+                if result["processed"] is None:
+                    raise ValueError("Could not preprocess this image.")
+                info = result.get("info", {})
+                result["status"] = (
+                    f"Printed OCR completed "
+                    f"({info.get('engine', '?')}, "
+                    f"confidence {info.get('confidence', 0):.0f}%)."
+                )
+
+            elif mode == "Handwriting OCR":
+                def progress(done, total, message):
+                    self.result_queue.put(
+                        ("progress", f"{message}: {done}/{total} lines"))
+                result = backend.handle_user_choice(
+                    path, "handwritten", progress_cb=progress)
+                result["status"] = "Handwriting recognition completed."
+
+            elif mode == "Table Extraction":
+                image, cells = extract_tables_from_image(path)
+                result = {"processed": image, "cells": cells,
+                          "text": "", "status": ""}
+                if cells:
+                    grid = cells_to_grid(cells)
+                    result["text"] = "\n".join("\t".join(r) for r in grid)
+                    result["status"] = (
+                        f"Table extraction completed: {len(grid)} rows x "
+                        f"{len(grid[0])} columns.")
+                else:
+                    result["status"] = "No table cells detected."
+            else:
+                raise ValueError(f"Unsupported processing mode: {mode}")
+
+            self.result_queue.put(("done", mode, result))
+        except Exception as exc:
+            self.result_queue.put(("error", str(exc)))
+
+    def _poll_worker(self):
+        finished = False
+        try:
+            while True:
+                message = self.result_queue.get_nowait()
+                kind = message[0]
+                if kind == "progress":
+                    self._set_status(message[1])
+                elif kind == "done":
+                    self._apply_result(message[1], message[2])
+                    finished = True
+                elif kind == "error":
+                    self._set_status("Processing failed.")
+                    messagebox.showerror(
+                        "Processing error",
+                        f"An error occurred:\n{message[1]}"
+                    )
+                    finished = True
+        except queue.Empty:
+            pass
+
+        if finished:
+            self.busy = False
+            self.process_btn.configure(state="normal")
+        else:
+            self.after(100, self._poll_worker)
+
+    def _apply_result(self, mode, result):
+        processed = result.get("processed")
+        self.processed_image = processed
+        if processed is not None:
+            self._show_cv_image(processed, self.processed_panel.image_label)
+        else:
+            self.processed_panel.image_label.configure(
+                image=None, text="Could not create the processed preview."
+            )
+            self.processed_panel.image_label.image = None
+
+        self._set_text(result.get("text", ""))
+        self._set_status(result.get("status", "Done."))
+
+        if mode == "Table Extraction":
+            self.table_cells = result.get("cells", [])
+            if not self.table_cells:
+                messagebox.showinfo(
+                    "No tables found",
+                    "No table cells were detected in this image."
+                )
+            else:
+                self._set_status(
+                    result["status"] + "  Use 'Export Table' to save it.")
+
+    def _set_text(self, text):
+        self.text_box.delete("1.0", "end")
+        self.text_box.insert("1.0", text or "")
+        self.current_text = text or ""
+
+    def clear_text(self):
+        if hasattr(self, "text_box"):
+            self.text_box.delete("1.0", "end")
+        self.current_text = ""
 
     def copy_text(self):
-        # Copy text to clipboard
-        text = self.text_area.get("1.0", tk.END)
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.root.update()
+        text = self.text_box.get("1.0", "end").strip()
+        if not text:
+            messagebox.showinfo("Nothing to copy", "There is no text to copy.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._set_status("Text copied to clipboard.")
+
+    def save_text(self):
+        text = self.text_box.get("1.0", "end").strip()
+        if not text:
+            messagebox.showinfo("No text", "Process a document or enter text first.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")]
+        )
+        if path:
+            with open(path, "w", encoding="utf-8") as file:
+                file.write(text)
+            self._set_status(f"Text saved: {os.path.basename(path)}")
 
     def save_image(self):
-        # Save the processed image
         if self.processed_image is None:
+            messagebox.showinfo(
+                "No processed image",
+                "Process a document first."
+            )
             return
-        file_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
-        if file_path:
-            cv2.imwrite(file_path, self.processed_image)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg")]
+        )
+        if path:
+            ext = os.path.splitext(path)[1] or ".png"
+            ok, buffer = cv2.imencode(ext, self.processed_image)
+            if ok:
+                buffer.tofile(path)  # works with non-ASCII paths on Windows
+                self._set_status(f"Image saved: {os.path.basename(path)}")
+            else:
+                messagebox.showerror("Save failed", "Could not save the image.")
 
-    def save_as_pdf(self):
-        file_path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")])
-        if not file_path:
+    def save_table(self):
+        if not self.table_cells:
+            messagebox.showinfo(
+                "No table",
+                "Run Table Extraction on an image with a table first."
+            )
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx"), ("CSV files", "*.csv")]
+        )
+        if not path:
+            return
+        try:
+            cells_to_file(self.table_cells, path)
+            self._set_status(f"Table saved: {os.path.basename(path)}")
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def save_pdf(self):
+        text = self.text_box.get("1.0", "end").strip()
+        if not text:
+            messagebox.showinfo("No text", "Process a document or enter text first.")
             return
 
-        c = canvas.Canvas(file_path, pagesize=letter)
-        width, height = letter
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")]
+        )
+        if not path:
+            return
 
-        text = self.text_area.get("1.0", tk.END).strip()
-        lines = text.split('\n')
-        y = height - 50  # starting point from top
+        pdf = canvas.Canvas(path, pagesize=letter)
+        page_width, page_height = letter
+        y = page_height - 50
+        pdf.setFont(self.pdf_font, 11)
 
-        for line in lines:
-            # Wrap line based on width
-            wrapped = simpleSplit(line, 'Helvetica', 12, width - 60)  # 30 left margin + 30 right margin
-            for wline in wrapped:
-                c.drawString(30, y, wline)
-                y -= 15
+        for line in text.splitlines() or [""]:
+            wrapped = simpleSplit(line, self.pdf_font, 11, page_width - 60)
+            for wrapped_line in wrapped or [""]:
                 if y < 50:
-                    c.showPage()
-                    y = height - 50
+                    pdf.showPage()
+                    pdf.setFont(self.pdf_font, 11)
+                    y = page_height - 50
+                pdf.drawString(30, y, wrapped_line)
+                y -= 15
 
-        c.save()
+        pdf.save()
+        self._set_status(f"PDF saved: {os.path.basename(path)}")
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = OCRApp(root)
-    root.mainloop()
+    app = OCRApp()
+    app.mainloop()
