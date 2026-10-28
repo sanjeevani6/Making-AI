@@ -256,13 +256,26 @@ def _estimate_line_pitch(profile):
     acf = acf / acf[0]
     lo, hi = max(8, n // 120), n // 2
     seg = acf[lo:hi]
-    peaks = [i for i in range(1, len(seg) - 1)
-             if seg[i] > seg[i - 1] and seg[i] >= seg[i + 1] and seg[i] > 0.15]
+    local = [i for i in range(1, len(seg) - 1)
+             if seg[i] > seg[i - 1] and seg[i] >= seg[i + 1]]
+    peaks = [i for i in local if seg[i] > 0.15]
     if not peaks:
         return None
     best = max(seg[i] for i in peaks)
     # smallest lag that is nearly as strong as the best one (avoids 2x pitch)
     pick = min(i for i in peaks if seg[i] >= 0.8 * best)
+    # The autocorrelation is often strongest at 2x (or 3x) the real line
+    # spacing, because a title or a gap makes every second line differ.
+    # If a clear peak exists near half the lag, the lines are that close.
+    while True:
+        lag = lo + pick
+        half = lag / 2.0
+        cands = [i for i in local
+                 if abs((lo + i) - half) <= max(2.0, 0.1 * half)
+                 and seg[i] >= max(0.08, 0.25 * seg[pick]) and lo + i >= 8]
+        if not cands:
+            break
+        pick = max(cands, key=lambda i: seg[i])
     return lo + pick, float(seg[pick])
 
 
@@ -439,21 +452,60 @@ def segment_handwriting_lines(image):
     if not final:
         return gray, []
     ref_h = float(np.median([b - t for t, b in final]))
+    merged_final = []
+    for seg in final:
+        if (merged_final and (seg[1] - seg[0]) < 0.45 * ref_h
+                and seg[0] - merged_final[-1][1] <= 0.15 * ref_h):
+            merged_final[-1][1] = seg[1]       # descenders of the line above
+        else:
+            merged_final.append(list(seg))
+    final = merged_final
     final = [b for b in final if (b[1] - b[0]) >= 0.3 * ref_h]
+    # A short band whose ink runs across most of the page width is a drawn
+    # underline / rule, not writing (it made TrOCR output junk lines).
+    kept = []
+    for t_, b_ in final:
+        if (b_ - t_) < 0.5 * ref_h:
+            cov = np.count_nonzero(
+                np.count_nonzero(ink[t_:b_], axis=0)) / float(W)
+            if cov > 0.6:
+                continue
+        kept.append([t_, b_])
+    final = kept
+    # Drop slivers that hold almost no ink (leftover ruled-line bits, dust).
+    mass = [np.count_nonzero(ink[t:b]) for t, b in final]
+    if mass:
+        floor = 0.2 * float(np.median(mass))
+        final = [seg for seg, m in zip(final, mass) if m >= floor]
+    if not final:
+        return gray, []
 
     lines = []
     for top, bottom in final:
         band = ink[top:bottom]
-        cols = np.where(np.count_nonzero(band, axis=0) > 0)[0]
+        bh = bottom - top
+        col_ink = np.count_nonzero(band, axis=0)
+        # Writing has several ink pixels per column; leftover ruled-line
+        # pieces have only 1-2. Using them stretched boxes to the page edge
+        # and forced splits through words.
+        cols = np.where(col_ink >= max(2, int(0.12 * bh)))[0]
+        if cols.size == 0:
+            cols = np.where(col_ink > 0)[0]
         if cols.size == 0:
             continue
         x1, x2 = int(cols[0]), int(cols[-1]) + 1
-        bh = bottom - top
-        py, px = int(0.25 * bh), int(0.5 * bh)
+        # Wide side margin: the first / last letters are often faint and
+        # missed by the ink mask (that is how "optical" became "ptical").
+        py, px = int(0.25 * bh), max(int(0.8 * bh), int(0.04 * W))
         y1, y2 = max(0, top - py), min(H, bottom + py)
 
         boxes = []
-        n = math.ceil((x2 - x1) / (config.HANDWRITING_MAX_ASPECT * bh))
+        # Use the typical line height, not this band's ink height: a band
+        # holding only x-height letters is short but is not "extra wide".
+        # The crop is bh + 2*py = 1.5 x taller than the ink band, and its
+        # width/height ratio is what TrOCR actually sees.
+        n = math.ceil((x2 - x1) / (config.HANDWRITING_MAX_ASPECT
+                                   * 1.5 * max(bh, ref_h)))
         if n > 1:
             col_profile = np.convolve(
                 np.count_nonzero(band, axis=0).astype(np.float32),
@@ -508,6 +560,14 @@ def recognize_handwriting(image_path, progress_cb=None):
         raise ValueError(f"Could not load image: {image_path}")
 
     image, _ = ensure_dark_on_light(image)
+
+    # Small photos (e.g. 230 px wide) carry too little detail for line
+    # detection and TrOCR alike: enlarge them first.
+    longest = max(image.shape[:2])
+    if longest < 1200:
+        s = min(4.0, 1200.0 / longest)
+        image = cv2.resize(image, None, fx=s, fy=s,
+                           interpolation=cv2.INTER_CUBIC)
 
     # Straighten photographed notebook pages.
     angle = estimate_skew(to_gray(image))

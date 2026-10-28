@@ -1,4 +1,3 @@
-
 import os
 import queue
 import threading
@@ -417,6 +416,10 @@ class OCRApp(ctk.CTk):
                     f"({info.get('engine', '?')}, "
                     f"confidence {info.get('confidence', 0):.0f}%)."
                 )
+                if info.get("confidence", 100) < 50:
+                    result["status"] += (
+                        "  Low confidence - if this is handwriting, "
+                        "use 'Handwriting OCR' instead.")
 
             elif mode == "Handwriting OCR":
                 def progress(done, total, message):
@@ -604,3 +607,4 @@ class OCRApp(ctk.CTk):
 if __name__ == "__main__":
     app = OCRApp()
     app.mainloop()
+    
